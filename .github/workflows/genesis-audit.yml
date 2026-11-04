@@ -64,7 +64,8 @@ jobs:
           with open('genesis_hash.txt') as f:
               found_hash = f.read().strip()
           with open('genesis_utxo.json') as f:
-              utxo = json.load(f)
+          utxo = json.loads(f.read().strip() or 'null')
+
 
           verify('Bitcoin mainnet', info['chain'] == 'main')
           verify('Genesis block hash', found_hash == BLOCK and block['hash'] == BLOCK)
