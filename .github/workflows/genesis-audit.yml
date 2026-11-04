@@ -1,0 +1,136 @@
+
+name: BitcoinQuantum Genesis Public Audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/genesis-audit.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  genesis-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download and checksum Bitcoin Core 31.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='31.2'
+          ARCHIVE="bitcoin-${VERSION}-x86_64-linux-gnu.tar.gz"
+          BASE="https://bitcoincore.org/bin/bitcoin-core-${VERSION}"
+          curl -fLsS --retry 3 -o "$ARCHIVE" "$BASE/$ARCHIVE"
+          curl -fLsS --retry 3 -o SHA256SUMS "$BASE/SHA256SUMS"
+          sha256sum --ignore-missing --check SHA256SUMS
+          tar -xzf "$ARCHIVE"
+          echo "$GITHUB_WORKSPACE/bitcoin-${VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Audit real Bitcoin Genesis block
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bq-node"
+          bitcoind -datadir="$RUNNER_TEMP/bq-node" -server=1 -disablewallet=1 -networkactive=0 -daemonwait
+          bitcoin-cli -datadir="$RUNNER_TEMP/bq-node" -rpcwait getblockchaininfo > blockchain_info.json
+          bitcoin-cli -datadir="$RUNNER_TEMP/bq-node" -rpcwait getblockhash 0 > genesis_hash.txt
+          HASH="$(cat genesis_hash.txt)"
+          bitcoin-cli -datadir="$RUNNER_TEMP/bq-node" -rpcwait getblock "$HASH" 2 > genesis_block.json
+          bitcoin-cli -datadir="$RUNNER_TEMP/bq-node" -rpcwait gettxout 4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b 0 > genesis_utxo.json
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from decimal import Decimal
+
+          ADDRESS = '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa'
+          BLOCK = '000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f'
+          TXID = '4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b'
+          P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+          checks = {}
+
+          def verify(label, condition):
+              checks[label] = bool(condition)
+              print(('PASS' if condition else 'FAIL') + ' | ' + label)
+              if not condition:
+                  raise SystemExit('AUDIT FAILED: ' + label)
+
+          with open('blockchain_info.json') as f:
+              info = json.load(f)
+          with open('genesis_block.json') as f:
+              block = json.load(f)
+          with open('genesis_hash.txt') as f:
+              found_hash = f.read().strip()
+          with open('genesis_utxo.json') as f:
+              utxo = json.load(f)
+
+          verify('Bitcoin mainnet', info['chain'] == 'main')
+          verify('Genesis block hash', found_hash == BLOCK and block['hash'] == BLOCK)
+          verify('Genesis block height', block['height'] == 0)
+          verify('Genesis block time', block['time'] == 1231006505)
+          verify('Exactly one genesis transaction', len(block['tx']) == 1)
+
+          tx = block['tx'][0]
+          verify('Original genesis transaction ID', tx['txid'] == TXID)
+          verify('Genesis coinbase transaction', 'coinbase' in tx['vin'][0])
+          verify('50 BTC genesis output', Decimal(str(tx['vout'][0]['value'])) == Decimal('50'))
+
+          script = bytes.fromhex(tx['vout'][0]['scriptPubKey']['hex'])
+          verify('Historical P2PK output script', len(script) == 67 and script[0] == 0x41 and script[-1] == 0xAC)
+          pubkey = script[1:66]
+          verify('Uncompressed public key format', len(pubkey) == 65 and pubkey[0] == 0x04)
+
+          x = int.from_bytes(pubkey[1:33], 'big')
+          y = int.from_bytes(pubkey[33:65], 'big')
+          verify('Public key on secp256k1', 0 <= x < P and 0 <= y < P and pow(y, 2, P) == (pow(x, 3, P) + 7) % P)
+
+          h160 = hashlib.new('ripemd160', hashlib.sha256(pubkey).digest()).digest()
+          verify('Genesis public key HASH160', h160.hex() == '62e907b15cbf27d5425399ebf6f0fb50ebb88f18')
+          payload = b'\x00' + h160
+          checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+          alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+          number = int.from_bytes(payload + checksum, 'big')
+          encoded = ''
+          while number:
+              number, digit = divmod(number, 58)
+              encoded = alphabet[digit] + encoded
+          zeroes = len(payload + checksum) - len((payload + checksum).lstrip(b'\x00'))
+          derived_address = ('1' * zeroes) + encoded
+          verify('Derived Base58Check address', derived_address == ADDRESS)
+
+          verify('Genesis coinbase absent from local UTXO set', utxo is None)
+          result = {
+              'target_address': ADDRESS,
+              'block_hash': BLOCK,
+              'genesis_txid': TXID,
+              'public_key_hex': pubkey.hex(),
+              'hash160': h160.hex(),
+              'derived_address': derived_address,
+              'checks': checks,
+              'ownership_status': 'NOT VERIFIED',
+              'scope': 'Offline Bitcoin Core genesis audit; not a full chain or address-balance audit'
+          }
+          with open('genesis_audit_report.json', 'w') as f:
+              json.dump(result, f, indent=2)
+          print('GENESIS EVIDENCE AUDIT: PASS')
+          print('KEY CONTROL: NOT VERIFIED')
+          print('LEGAL OWNERSHIP: NOT DETERMINED')
+          PY
+
+          sha256sum genesis_audit_report.json
+          bitcoin-cli -datadir="$RUNNER_TEMP/bq-node" stop
+
+      - name: Publish public audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitcoinquantum-genesis-evidence
+          path: |
+            blockchain_info.json
+            genesis_hash.txt
+            genesis_block.json
+            genesis_utxo.json
+            genesis_audit_report.json
+          if-no-files-found: warn
